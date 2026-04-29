@@ -275,6 +275,7 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
     events_log: list[dict[str, Any]] = []
     worker_log: dict[str, list[dict[str, Any]]] = {wid: [] for wid in workers}
     global_start_log: list[int] = []
+    utilization: dict[str, int] = {"cpu_time": 0, "ram_time": 0, "gpu_time": 0}
 
     # Track per-key currently-running tasks and the most recent successful
     # signature so we can implement idempotency rules.
@@ -295,7 +296,12 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         entry.update(fields)
         worker_log[worker.id].append(entry)
 
-    def release_resources(worker: _Worker, task: _Task) -> None:
+    def release_resources(worker: _Worker, task: _Task, time_ms: int) -> None:
+        if task._attempt_start is not None:
+            elapsed = max(0, time_ms - task._attempt_start)
+            utilization["cpu_time"] += task.cpu * elapsed
+            utilization["ram_time"] += task.ram * elapsed
+            utilization["gpu_time"] += task.gpu * elapsed
         worker.cpu_used -= task.cpu
         worker.ram_used -= task.ram
         worker.gpu_used -= task.gpu
@@ -324,7 +330,7 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
     def cancel_running(task: _Task, time_ms: int, reason: str) -> None:
         worker = workers[task.worker_id] if task.worker_id else None
         if worker is not None:
-            release_resources(worker, task)
+            release_resources(worker, task, time_ms)
             log_worker(worker, time_ms, "task_cancelled", task_id=task.id)
         if task.idempotency_key is not None:
             running_idempotency.pop(task.idempotency_key, None)
@@ -338,9 +344,10 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         """Handle a single failed attempt. Returns ``True`` if the task is
         retried, ``False`` if it has terminally failed.
         """
+        failed_worker_id = task.worker_id
         worker = workers[task.worker_id] if task.worker_id else None
         if worker is not None:
-            release_resources(worker, task)
+            release_resources(worker, task, time_ms)
             log_worker(worker, time_ms, "task_failed_attempt", task_id=task.id)
         if task.idempotency_key is not None:
             running_idempotency.pop(task.idempotency_key, None)
@@ -353,19 +360,20 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         )
         task._attempt_start = None
         task._attempt_fail_at = None
-        task.worker_id = None
         if task.retryable and task.attempts <= task.max_retries:
             task.status = STATUS_PENDING
+            task.worker_id = None
             return True
         task.status = STATUS_FAILED
         task.finished_at = time_ms
+        task.worker_id = failed_worker_id
         task.failure_reason = reason
         return False
 
     def finish_running(task: _Task, time_ms: int) -> None:
         worker = workers[task.worker_id] if task.worker_id else None
         if worker is not None:
-            release_resources(worker, task)
+            release_resources(worker, task, time_ms)
             log_worker(worker, time_ms, "task_finished", task_id=task.id)
         log_event(
             time_ms,
@@ -563,8 +571,6 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         ]
         ready.sort(key=_ordering_key)
         for task in ready:
-            if not _within_rate(global_start_log, time_ms, global_rate):
-                break
             try_start(task, time_ms)
 
         time_ms += tick_ms
@@ -583,25 +589,23 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         "deadline_missed": 0,
         "total_attempts": 0,
     }
-    utilization: dict[str, int] = {"cpu_time": 0, "ram_time": 0, "gpu_time": 0}
-
     for tid, task in tasks.items():
         # Anything still running or pending at the end of the simulation is
         # reported as ``pending`` per the spec.
         public_status = task.status
         if public_status == _INTERNAL_RUNNING:
+            if task._attempt_start is not None:
+                elapsed = max(0, end_time - task._attempt_start)
+                utilization["cpu_time"] += task.cpu * elapsed
+                utilization["ram_time"] += task.ram * elapsed
+                utilization["gpu_time"] += task.gpu * elapsed
             public_status = STATUS_PENDING
 
         # Compute deadline_missed.
-        if public_status == STATUS_SUCCESS:
+        if public_status in (STATUS_SUCCESS, STATUS_DEDUPLICATED):
             deadline_missed = (
                 task.finished_at is not None and task.finished_at > task.deadline_ms
             )
-        elif public_status in (
-            STATUS_DEDUPLICATED,
-            STATUS_IDEMPOTENCY_CONFLICT,
-        ):
-            deadline_missed = False
         else:
             deadline_missed = end_time > task.deadline_ms
 
@@ -619,15 +623,6 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         if deadline_missed:
             counts["deadline_missed"] += 1
         counts["total_attempts"] += task.attempts
-
-        # Approximate utilization: duration_ms * resources for successful
-        # tasks. Failed/cancelled attempts also consume resources but the
-        # spec only requires a representative figure.
-        if public_status == STATUS_SUCCESS and task.started_at is not None:
-            elapsed = (task.finished_at or task.started_at) - task.started_at
-            utilization["cpu_time"] += task.cpu * elapsed
-            utilization["ram_time"] += task.ram * elapsed
-            utilization["gpu_time"] += task.gpu * elapsed
 
     metrics: dict[str, Any] = dict(counts)
     metrics["resource_utilization"] = utilization

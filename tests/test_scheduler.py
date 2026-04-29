@@ -182,6 +182,7 @@ class TestRetry(unittest.TestCase):
         self.assertEqual(out["tasks"]["A"]["status"], "failed")
         self.assertEqual(out["tasks"]["A"]["attempts"], 1)
         self.assertEqual(out["tasks"]["A"]["failure_reason"], "scripted_failure")
+        self.assertEqual(out["tasks"]["A"]["worker_id"], "w1")
 
     def test_retry_exhausted(self) -> None:
         out = run_simulation(
@@ -260,6 +261,35 @@ class TestRateLimits(unittest.TestCase):
         self.assertGreaterEqual(starts[1], 1000)
         self.assertGreaterEqual(starts[2], 2000)
 
+    def test_idempotency_resolution_is_not_throttled_by_start_rate(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[task("A", duration_ms=100, idempotency_key="K")],
+                events=[
+                    {
+                        "time_ms": 100,
+                        "type": "add_task",
+                        "task": task("B", duration_ms=100, idempotency_key="K"),
+                    }
+                ],
+                global_rate=1,
+                end_time=2000,
+                workers=[
+                    {
+                        "id": "w1",
+                        "cpu": 8,
+                        "ram": 16000,
+                        "gpu": 0,
+                        "local_rate_limit_per_sec": 100,
+                        "clock_skew_ms": 0,
+                        "offline_windows": [],
+                    }
+                ],
+            )
+        )
+        self.assertEqual(out["tasks"]["B"]["status"], "deduplicated")
+        self.assertEqual(out["tasks"]["B"]["finished_at"], 100)
+
 
 class TestResources(unittest.TestCase):
     def test_resource_starvation_serializes_tasks(self) -> None:
@@ -290,6 +320,27 @@ class TestResources(unittest.TestCase):
         self.assertEqual(starts[0], 0)
         self.assertGreaterEqual(starts[1], 1000)
         self.assertGreaterEqual(starts[2], 2000)
+
+    def test_resource_utilization_counts_failed_attempts(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[
+                    task(
+                        "A",
+                        duration_ms=1000,
+                        cpu=2,
+                        ram=300,
+                        retryable=False,
+                        failures=[{"attempt": 1, "fail_at_ms": 200}],
+                    )
+                ]
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "failed")
+        self.assertEqual(
+            out["metrics"]["resource_utilization"],
+            {"cpu_time": 400, "ram_time": 60000, "gpu_time": 0},
+        )
 
 
 class TestOfflineWorker(unittest.TestCase):
@@ -427,6 +478,35 @@ class TestDeadlines(unittest.TestCase):
             )
         )
         self.assertEqual(out["tasks"]["B"]["status"], "blocked")
+        self.assertTrue(out["tasks"]["B"]["deadline_missed"])
+
+    def test_deduplicated_task_can_miss_deadline(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[
+                    task(
+                        "A",
+                        duration_ms=100,
+                        deadline_ms=500,
+                        idempotency_key="K",
+                    )
+                ],
+                events=[
+                    {
+                        "time_ms": 1000,
+                        "type": "add_task",
+                        "task": task(
+                            "B",
+                            duration_ms=100,
+                            deadline_ms=500,
+                            idempotency_key="K",
+                        ),
+                    }
+                ],
+                end_time=2000,
+            )
+        )
+        self.assertEqual(out["tasks"]["B"]["status"], "deduplicated")
         self.assertTrue(out["tasks"]["B"]["deadline_missed"])
 
 

@@ -89,7 +89,8 @@ The result mirrors the schema given in the issue:
 * `worker_log` — per-worker chronological log including the
   skew-adjusted `worker_time_ms`.
 * `metrics` — counts for every status, total attempts, deadline misses,
-  and a coarse `resource_utilization` aggregate.
+  and `resource_utilization` measured as CPU/RAM/GPU milliseconds spent
+  by completed, failed, cancelled, and still-running attempts.
 
 ## 2. Complexity
 
@@ -129,6 +130,9 @@ simulator runs in tens of milliseconds.
   immediately.
 * Sliding rate-limit windows are computed inclusively over the last
   1000 ms (`[t-999, t]`).
+* Idempotency deduplication and conflict resolution do not consume a
+  task start and therefore are not delayed by saturated start-rate
+  limits.
 * Worker clock skew only affects entries in the worker log; the global
   scheduling logic uses real simulation time.
 * Tasks that are still running or pending when `end_time` is reached are
@@ -160,6 +164,9 @@ important interpretations made by this implementation are:
 6. **Blocked detection runs every tick**, not just immediately after a
    parent fails, so tasks added later (via `add_task`) that depend on
    already-failed tasks are immediately blocked.
+7. **Deadline reporting for deduplicated work** uses the deduplication
+   timestamp as `finished_at`; if that timestamp is after
+   `deadline_ms`, `deadline_missed` is `true`.
 
 Each of these choices is covered by at least one unit test in
 `tests/test_scheduler.py`.
@@ -168,8 +175,8 @@ Each of these choices is covered by at least one unit test in
 
 * The simulator uses a fixed tick. Sub-tick precision (e.g. a duration
   of 50 ms with `tick_ms = 100`) is rounded up to the next tick.
-* Resource utilization is computed only for successful tasks, not for
-  partial attempts, and is therefore a lower bound on actual usage.
+* Resource utilization is rounded to the simulator's tick resolution.
+  Sub-tick resource occupancy is not represented.
 * The rate-limit start log grows monotonically; for very long
   simulations it could be pruned to keep memory bounded. We have not
   implemented pruning since the issue specifies bounded inputs.
@@ -202,6 +209,8 @@ Each of these choices is covered by at least one unit test in
 * Deadline reporting without auto-cancellation.
 * Output structure matches the spec (tasks, events_log, worker_log,
   metrics).
+* Resource utilization includes successful, failed, cancelled, and
+  in-progress attempt time.
 
 ### Potentially debatable
 
@@ -222,8 +231,8 @@ Each of these choices is covered by at least one unit test in
   using a strict `cutoff = t - 999`).
 * Edge cases around tasks added after their declared dependencies have
   been blocked: handled by re-checking `deps_state` every tick.
-* Resource utilization currently rounds duration to whole ticks for
-  successful tasks; if accuracy matters this should be revisited.
+* Resource utilization currently rounds duration to whole ticks; if
+  sub-tick accuracy matters this should be revisited.
 
 ### Tests we would add given more time
 
