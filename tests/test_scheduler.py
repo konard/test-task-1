@@ -695,5 +695,166 @@ class TestExampleFromIssue(unittest.TestCase):
             self.assertIn(key, out["metrics"])
 
 
+class TestMillisecondPrecision(unittest.TestCase):
+    """Time semantics are millisecond-precise, not snapped to ``tick_ms``.
+
+    These tests cover the reviewer's concerns from PR feedback: a task with
+    ``duration_ms`` smaller than ``tick_ms`` must finish at exactly
+    ``duration_ms`` (not at the next tick), a sub-tick scripted failure must
+    fire at its exact ms, and an ``add_task`` event whose ``time_ms`` is not
+    aligned to ``tick_ms`` must still fire at its exact ms.
+    """
+
+    def test_subtick_duration_finishes_at_exact_ms(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[task("A", duration_ms=50)],
+                tick_ms=100,
+                end_time=2000,
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "success")
+        self.assertEqual(out["tasks"]["A"]["started_at"], 0)
+        self.assertEqual(out["tasks"]["A"]["finished_at"], 50)
+
+    def test_subtick_fail_at_logs_at_exact_ms(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[
+                    task(
+                        "A",
+                        duration_ms=1000,
+                        retryable=False,
+                        failures=[{"attempt": 1, "fail_at_ms": 50}],
+                    )
+                ],
+                tick_ms=100,
+                end_time=2000,
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "failed")
+        self.assertEqual(out["tasks"]["A"]["finished_at"], 50)
+        failure_events = [
+            e for e in out["events_log"] if e["type"] == "task_failed_attempt"
+        ]
+        self.assertEqual(len(failure_events), 1)
+        self.assertEqual(failure_events[0]["time_ms"], 50)
+
+    def test_add_task_off_tick_fires_at_exact_ms(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[],
+                tick_ms=100,
+                end_time=5000,
+                events=[
+                    {
+                        "time_ms": 50,
+                        "type": "add_task",
+                        "task": task("Z", duration_ms=200),
+                    }
+                ],
+            )
+        )
+        self.assertIn("Z", out["tasks"])
+        self.assertEqual(out["tasks"]["Z"]["status"], "success")
+        # Task can start no earlier than its add time, exactly at 50.
+        self.assertEqual(out["tasks"]["Z"]["started_at"], 50)
+        self.assertEqual(out["tasks"]["Z"]["finished_at"], 250)
+        # Verify the add was logged at the exact ms.
+        adds = [e for e in out["events_log"] if e["type"] == "task_added"]
+        self.assertEqual(len(adds), 1)
+        self.assertEqual(adds[0]["time_ms"], 50)
+
+    def test_cancel_off_tick_fires_at_exact_ms(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[task("A", duration_ms=5000)],
+                tick_ms=100,
+                end_time=2000,
+                events=[
+                    {"time_ms": 250, "type": "cancel_task", "task_id": "A"},
+                ],
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "cancelled")
+        self.assertEqual(out["tasks"]["A"]["finished_at"], 250)
+
+    def test_offline_window_off_tick_terminates_at_exact_ms(self) -> None:
+        out = run_simulation(
+            make_input(
+                tasks=[task("A", duration_ms=5000, retryable=False)],
+                tick_ms=100,
+                end_time=5000,
+                workers=[
+                    {
+                        "id": "w1",
+                        "cpu": 8,
+                        "ram": 16000,
+                        "gpu": 0,
+                        "local_rate_limit_per_sec": 100,
+                        "clock_skew_ms": 0,
+                        "offline_windows": [[1234, 4321]],
+                    }
+                ],
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "failed")
+        self.assertEqual(out["tasks"]["A"]["failure_reason"], "worker_offline")
+        self.assertEqual(out["tasks"]["A"]["finished_at"], 1234)
+
+    def test_finish_at_offline_start_succeeds_first(self) -> None:
+        """A task whose natural completion lands exactly on the moment the
+        worker goes offline should succeed, not be charged a failed attempt.
+        """
+        out = run_simulation(
+            make_input(
+                tasks=[task("A", duration_ms=2000, retryable=False)],
+                tick_ms=100,
+                end_time=5000,
+                workers=[
+                    {
+                        "id": "w1",
+                        "cpu": 8,
+                        "ram": 16000,
+                        "gpu": 0,
+                        "local_rate_limit_per_sec": 100,
+                        "clock_skew_ms": 0,
+                        # Worker goes offline at t=2000 — exactly when A
+                        # would finish. A should succeed, not fail.
+                        "offline_windows": [[2000, 4000]],
+                    }
+                ],
+            )
+        )
+        self.assertEqual(out["tasks"]["A"]["status"], "success")
+        self.assertEqual(out["tasks"]["A"]["finished_at"], 2000)
+
+    def test_independent_of_tick_ms_value(self) -> None:
+        """The same scenario should produce identical task outcomes for
+        any reasonable ``tick_ms`` (including a value that does not divide
+        any of the durations).
+        """
+
+        def scenario(tick: int) -> dict[str, Any]:
+            return make_input(
+                tasks=[
+                    task("A", duration_ms=137, priority=5),
+                    task("B", duration_ms=263, depends_on=["A"]),
+                ],
+                tick_ms=tick,
+                end_time=2000,
+            )
+
+        a = run_simulation(scenario(1))
+        b = run_simulation(scenario(7))
+        c = run_simulation(scenario(100))
+        for out in (a, b, c):
+            self.assertEqual(out["tasks"]["A"]["finished_at"], 137)
+            self.assertEqual(out["tasks"]["A"]["status"], "success")
+            self.assertEqual(out["tasks"]["B"]["started_at"], 137)
+            self.assertEqual(out["tasks"]["B"]["finished_at"], 137 + 263)
+            self.assertEqual(out["tasks"]["B"]["status"], "success")
+
+
 if __name__ == "__main__":
     unittest.main()

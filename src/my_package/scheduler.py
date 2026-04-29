@@ -10,6 +10,7 @@ analysis, edge cases, and limitations.
 
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -245,6 +246,9 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
     if tick_ms <= 0:
         msg = "simulation.tick_ms must be positive"
         raise SchedulerError(msg)
+    if end_time < start_time:
+        msg = "simulation.end_time must be >= simulation.start_time"
+        raise SchedulerError(msg)
     global_rate = int(sim.get("global_rate_limit_per_sec", 0))
 
     workers: dict[str, _Worker] = {}
@@ -265,8 +269,10 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
 
     _detect_cycle(tasks)
 
-    # Pre-index events by their tick time. ``add_task`` events introduce new
-    # tasks; ``cancel_task`` events mark targets for cancellation.
+    # Pre-index events by their exact millisecond time. ``add_task`` events
+    # introduce new tasks; ``cancel_task`` events mark targets for
+    # cancellation. Events at any millisecond fire at that exact ms — they
+    # are not snapped to tick boundaries.
     events_by_time: dict[int, list[dict[str, Any]]] = {}
     for ev in input_json.get("events", []) or []:
         t = int(ev["time_ms"])
@@ -525,11 +531,88 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
                 log_worker(worker, time_ms, "worker_online")
                 log_event(time_ms, "worker_online", worker_id=worker.id)
 
-    # --- Tick loop ---------------------------------------------------------
+    # --- Discrete-event time advance --------------------------------------
+    #
+    # Time advances to the next significant moment with millisecond
+    # precision. The set of moments is:
+    #   * every periodic re-evaluation tick at start_time + k*tick_ms,
+    #   * every external event time (exact ms),
+    #   * every offline-window edge (start and end), exact ms,
+    #   * every dynamic completion / scripted-failure time of a running
+    #     task, exact ms.
+    #
+    # ``tick_ms`` therefore acts as a periodic re-evaluation cadence (so a
+    # task that could not start on a previous tick because of a saturated
+    # rate window gets retried), but it never snaps event/completion/
+    # failure semantics to a tick boundary.
 
-    time_ms = start_time
-    while time_ms <= end_time:
-        # 1. Apply discrete events scheduled exactly at this tick.
+    # Future moments to visit. We wake up on every event, every offline
+    # edge inside the simulation window, and every periodic tick.
+    pending_moments: set[int] = set()
+    for t in events_by_time:
+        if start_time <= t <= end_time:
+            pending_moments.add(t)
+    for worker in workers.values():
+        for win_start, win_end in worker.offline_windows:
+            if start_time <= win_start <= end_time:
+                pending_moments.add(win_start)
+            if start_time <= win_end <= end_time:
+                pending_moments.add(win_end)
+    # Periodic ticks for re-evaluation, plus the start and end times.
+    pending_moments.add(start_time)
+    pending_moments.add(end_time)
+    t_tick = start_time + tick_ms
+    while t_tick <= end_time:
+        pending_moments.add(t_tick)
+        t_tick += tick_ms
+
+    # Heap of times we still need to visit. Use a heap so dynamically-added
+    # moments (completions, scripted failures, rate-window expirations,
+    # added events) interleave correctly with the static schedule.
+    moment_heap: list[int] = sorted(pending_moments)
+    heapq.heapify(moment_heap)
+
+    def schedule_moment(t: int) -> None:
+        """Insert ``t`` into the moment heap if it lies in the simulation
+        window and is not already present.
+        """
+        if t < start_time or t > end_time:
+            return
+        if t not in pending_moments:
+            pending_moments.add(t)
+            heapq.heappush(moment_heap, t)
+
+    def schedule_dynamic_for_running(task: _Task) -> None:
+        """Enqueue the task's natural completion and scripted-failure
+        moments so the simulator wakes up at exactly the right ms.
+        """
+        if task._attempt_start is None:
+            return
+        completion = task._attempt_start + task.duration_ms
+        schedule_moment(completion)
+        if task._attempt_fail_at is not None:
+            schedule_moment(task._attempt_fail_at)
+
+    def is_offline_start(t: int) -> bool:
+        for w in workers.values():
+            for win_start, _ in w.offline_windows:
+                if win_start == t:
+                    return True
+        return False
+
+    last_t = start_time - 1
+    while moment_heap:
+        time_ms = heapq.heappop(moment_heap)
+        if time_ms == last_t:
+            continue
+        last_t = time_ms
+        if time_ms > end_time:
+            break
+
+        offline_start_here = is_offline_start(time_ms)
+
+        # 1. Apply discrete events scheduled exactly at this ms. Events
+        #    fire at their precise time_ms regardless of tick alignment.
         for ev in events_by_time.get(time_ms, []):
             etype = ev.get("type")
             if etype == "add_task":
@@ -539,20 +622,46 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
             else:
                 log_event(time_ms, "event_ignored", details=ev)
 
-        # 2. Apply offline-window transitions (after events so newly added
-        #    tasks see the current state).
+        # 2a. Resolve task completions and scripted failures BEFORE
+        #     applying an offline-window-start transition. This means a
+        #     task whose natural completion lands exactly on the moment a
+        #     worker goes offline succeeds first, instead of being failed
+        #     by the offline transition.
+        if offline_start_here:
+            for task in list(tasks.values()):
+                if task.status != _INTERNAL_RUNNING:
+                    continue
+                assert task._attempt_start is not None
+                if (
+                    task._attempt_fail_at is not None
+                    and time_ms >= task._attempt_fail_at
+                    and task._attempt_fail_at <= task._attempt_start + task.duration_ms
+                ):
+                    fail_attempt(task, time_ms, "scripted_failure")
+                    continue
+                if time_ms >= task._attempt_start + task.duration_ms:
+                    finish_running(task, time_ms)
+
+        # 2b. Apply offline-window transitions (after events so newly added
+        #     tasks see the current state).
         update_offline_state(time_ms)
 
-        # 3. Resolve task completions and scheduled failures.
-        for task in list(tasks.values()):
-            if task.status != _INTERNAL_RUNNING:
-                continue
-            assert task._attempt_start is not None
-            if task._attempt_fail_at is not None and time_ms >= task._attempt_fail_at:
-                fail_attempt(task, time_ms, "scripted_failure")
-                continue
-            if time_ms >= task._attempt_start + task.duration_ms:
-                finish_running(task, time_ms)
+        # 3. Resolve remaining task completions and scripted failures (for
+        #    moments that are NOT offline-window starts, this is the only
+        #    place completions are processed).
+        if not offline_start_here:
+            for task in list(tasks.values()):
+                if task.status != _INTERNAL_RUNNING:
+                    continue
+                assert task._attempt_start is not None
+                if (
+                    task._attempt_fail_at is not None
+                    and time_ms >= task._attempt_fail_at
+                ):
+                    fail_attempt(task, time_ms, "scripted_failure")
+                    continue
+                if time_ms >= task._attempt_start + task.duration_ms:
+                    finish_running(task, time_ms)
 
         # 4. Mark tasks that are unrecoverably blocked.
         for task in tasks.values():
@@ -571,9 +680,13 @@ def run_simulation(input_json: dict[str, Any]) -> dict[str, Any]:
         ]
         ready.sort(key=_ordering_key)
         for task in ready:
-            try_start(task, time_ms)
-
-        time_ms += tick_ms
+            if try_start(task, time_ms):
+                schedule_dynamic_for_running(task)
+                # When a start consumes a slot in a rate window, that
+                # window will free up exactly 1000 ms later — schedule a
+                # wake-up so other tasks can be retried at the precise ms
+                # the limit lifts.
+                schedule_moment(time_ms + 1000)
 
     # --- Build output ------------------------------------------------------
 

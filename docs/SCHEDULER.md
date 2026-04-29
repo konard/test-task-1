@@ -6,10 +6,10 @@ limitations of the implementation.
 
 ## 1. Architecture
 
-The scheduler is a single-threaded, **discrete-time tick-based simulator**.
-The whole simulation is implemented in pure Python with no external
-dependencies (only `collections`, `dataclasses`, and `typing` from the
-standard library).
+The scheduler is a single-threaded, **discrete-event simulator** with
+millisecond-precision time semantics. The whole simulation is implemented
+in pure Python with no external dependencies (only `collections`,
+`dataclasses`, `heapq`, and `typing` from the standard library).
 
 ### 1.1 Core entities
 
@@ -20,27 +20,54 @@ standard library).
   usage, online flag, sliding-window start log for rate-limit checks, and
   static config (skew, offline windows, capacity).
 
-### 1.2 Tick loop
+### 1.2 Time advance and per-moment pipeline
 
-For every tick `t = start_time, start_time + tick_ms, …, end_time` the
-simulator performs the following deterministic steps:
+Time advances to the next *significant moment* drawn from a min-heap that
+contains:
+
+* every periodic re-evaluation tick at `start_time + k · tick_ms`,
+* every external event time (exact ms),
+* every offline-window edge (start and end), exact ms,
+* every dynamic completion / scripted-failure time of a running task,
+  exact ms,
+* every rate-limit window expiration `start + 1000 ms` so a deferred
+  start is retried at the precise ms the limit lifts.
+
+`tick_ms` therefore acts purely as a periodic re-evaluation cadence (so a
+task that could not start because of a saturated rate window or a
+resource conflict gets retried even when no other event fires); it never
+snaps event, completion, or scripted-failure semantics to a tick
+boundary. As a consequence, the same scenario produces identical task
+outcomes for any reasonable `tick_ms` (covered by
+`test_independent_of_tick_ms_value`).
+
+For every visited moment `t` the simulator performs the following
+deterministic steps:
 
 1. **Apply discrete events** scheduled exactly at `t`
-   (`add_task`, `cancel_task`).
-2. **Update worker online/offline state.** When a worker transitions from
-   online → offline, every task currently running on it is terminated as a
+   (`add_task`, `cancel_task`). An `add_task` event fires at its declared
+   `time_ms`, even when that ms is not a multiple of `tick_ms`.
+2. **At an offline-window-start moment**, *first* resolve completions and
+   scripted failures that were due at or before `t`. This means a task
+   whose natural `attempt_start + duration_ms` lands exactly on the ms
+   the worker goes offline succeeds instead of being failed by the
+   offline transition.
+3. **Update worker online/offline state.** When a worker transitions from
+   online → offline, every task still running on it is terminated as a
    `failed_attempt` (with reason `worker_offline`).
-3. **Resolve completions and scripted failures.** Running tasks whose
+4. **Resolve completions and scripted failures.** Running tasks whose
    scripted failure time is reached fail; otherwise running tasks whose
-   `start + duration_ms` has elapsed succeed.
-4. **Mark unrecoverably blocked tasks.** A pending task whose dependency
+   `attempt_start + duration_ms` has elapsed succeed.
+5. **Mark unrecoverably blocked tasks.** A pending task whose dependency
    set contains any failed/cancelled/blocked/idempotency-conflict task is
    transitioned to `blocked`.
-5. **Schedule new starts.** Pending tasks with all dependencies satisfied
+6. **Schedule new starts.** Pending tasks with all dependencies satisfied
    are sorted using the canonical priority key
    `(-priority, deadline_ms, id)` and offered the workers in ascending
    `worker_id` order. A start is admitted only when CPU/RAM/GPU fit and
-   both rate windows allow it.
+   both rate windows allow it. Successful starts enqueue their natural
+   completion and scripted-failure moments so the simulator wakes up at
+   the precise ms.
 
 ### 1.3 Determinism guarantees
 
@@ -95,26 +122,38 @@ The result mirrors the schema given in the issue:
 ## 2. Complexity
 
 Let `T` be the number of tasks (including those added by events), `W` the
-number of workers, `D` the number of dependency edges, and `N` the number
-of simulator ticks (`(end_time − start_time) / tick_ms + 1`).
+number of workers, `D` the number of dependency edges, and `M` the
+number of distinct *moments* visited by the discrete-event loop (bounded
+above by `(end_time − start_time) / tick_ms + 1` plus the number of
+events, offline edges, completion times, scripted failure times, and
+rate-limit expirations).
 
-| Operation                       | Complexity |
-| ------------------------------- | ---------- |
-| Cycle detection (Kahn)          | `O(T + D)` |
-| Per-tick event application      | `O(E_t)` where `E_t` is events at tick `t` |
-| Per-tick offline transition     | `O(W + R)` where `R` is the number of currently running tasks |
-| Per-tick ready set construction | `O(T · D)` worst case (dependency lookup per pending task) |
-| Per-tick scheduling             | `O(P · W)` where `P` is the number of ready tasks at the tick |
-| Per-tick rate-limit check       | `O(L)` where `L` is the number of starts in the recent window |
-| **Total**                       | `O(N · (T · D + P · W + L))` |
+| Operation                         | Complexity |
+| --------------------------------- | ---------- |
+| Cycle detection (Kahn)            | `O(T + D)` |
+| Per-moment event application      | `O(E_t)` where `E_t` is events at moment `t` |
+| Per-moment offline transition     | `O(W + R)` where `R` is the number of currently running tasks |
+| Per-moment ready set construction | `O(T · D)` worst case (dependency lookup per pending task) |
+| Per-moment scheduling             | `O(P · W)` where `P` is the number of ready tasks at the moment |
+| Per-moment rate-limit check       | `O(L)` where `L` is the number of starts in the recent window |
+| Heap push / pop                   | `O(log M)` per moment |
+| **Total**                         | `O(M · (T · D + P · W + L + log M))` |
 
-In practice `L` is bounded by the per-second rate limits, `P ≤ T`, and the
-hot path is dominated by the simple `T · D` dependency scan. For typical
-scenarios with `N` in the low thousands and `T` in the hundreds the
-simulator runs in tens of milliseconds.
+In practice `L` is bounded by the per-second rate limits, `P ≤ T`, and
+the hot path is dominated by the simple `T · D` dependency scan. For
+typical scenarios with `M` in the low thousands and `T` in the hundreds
+the simulator runs in tens of milliseconds.
 
 ## 3. Edge cases handled
 
+* Sub-`tick_ms` values fire at their exact ms: `duration_ms = 50` with
+  `tick_ms = 100` finishes at 50, `fail_at_ms = 50` is logged at 50,
+  `add_task` at `time_ms = 50` fires at 50, `cancel_task` at non-tick
+  times cancels at the exact ms, and offline windows starting at non-tick
+  times take effect at the exact ms.
+* A task whose natural completion lands exactly on the moment a worker
+  goes offline succeeds first (it has already finished); the offline
+  transition only kills tasks that are still running at that ms.
 * Dependency graphs containing cycles raise `DependencyCycleError`
   before the simulation starts. `add_task` events that would introduce a
   cycle are rejected and logged as `add_task_ignored`.
@@ -173,10 +212,9 @@ Each of these choices is covered by at least one unit test in
 
 ## 5. Known limitations
 
-* The simulator uses a fixed tick. Sub-tick precision (e.g. a duration
-  of 50 ms with `tick_ms = 100`) is rounded up to the next tick.
-* Resource utilization is rounded to the simulator's tick resolution.
-  Sub-tick resource occupancy is not represented.
+* Resource utilization is computed as exact `cpu/ram/gpu` × elapsed-ms
+  per attempt. Because time is millisecond-precise, utilization is
+  millisecond-precise as well.
 * The rate-limit start log grows monotonically; for very long
   simulations it could be pruned to keep memory bounded. We have not
   implemented pruning since the issue specifies bounded inputs.
