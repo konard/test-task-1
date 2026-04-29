@@ -1,13 +1,28 @@
-"""Example module entry point.
+"""Public package entry point.
 
-Replace this with your actual implementation.
+Exposes both the legacy template helpers (``add``, ``multiply``, ``delay``)
+and the deterministic distributed task scheduler simulator
+(:func:`run_simulation`).
 """
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+from my_package.scheduler import (
+    DependencyCycleError,
+    SchedulerError,
+    run_simulation,
+)
 
-__all__ = ["add", "multiply", "delay"]
+__version__ = "0.2.0"
+
+__all__ = [
+    "DependencyCycleError",
+    "SchedulerError",
+    "add",
+    "delay",
+    "multiply",
+    "run_simulation",
+]
 
 
 def add(a: int | float, b: int | float) -> int | float:
